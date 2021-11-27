@@ -1,0 +1,2 @@
+svnuser = John Doe <john.doe@example.com>
+svnuser2 = Mary Jane Watson <mjwatson@example.com>
