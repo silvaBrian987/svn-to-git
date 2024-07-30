@@ -8,6 +8,7 @@ import sys
 import psutil
 from git import Repo, RemoteReference
 import argparse
+import signal
 
 if platform.system() == "Windows":
     AUTHORS_DEFAULT_FILEPATH = "authors.txt"
@@ -55,6 +56,10 @@ def execute(cmd):
         process.stdout.close()
         process.wait()
         return process.returncode, "\n".join(output)
+    except KeyboardInterrupt:
+        # process.send_signal(signal.SIGINT)
+        kill_proc_tree(process.pid, including_parent=False)
+        # exit(-1)
     except Exception as e:
         print(e)
         kill_proc_tree(process.pid, including_parent=False)
@@ -82,12 +87,17 @@ if __name__ == "__main__":
     parser.add_argument("--svn-revisions", default="BASE:HEAD")
     parser.add_argument("--git-repos-path", default="git_repos/")
     parser.add_argument("--git-base-url", default="https://github.com/username/")
+    parser.add_argument("--ignore-history", action="store_true")
+    parser.add_argument("--no-stdlayout", action="store_true")
 
     args = parser.parse_args()
 
-    SVN_USERNAME = args.svn_username
-    SVN_PASSWORD = args.svn_password
-    REMOTE_URL_BASE = args.git_base_url
+    svn_username = args.svn_username
+    svn_password = args.svn_password
+    remote_url_base = args.git_base_url
+    svn_revisions = args.svn_revisions
+    no_stdlayout = args.no_stdlayout
+    ignore_history = args.ignore_history
 
     lines = []
     with open(args.svn_repos_file, "r") as f:
@@ -105,14 +115,17 @@ if __name__ == "__main__":
             continue
         print(line)
         r = svn.remote.RemoteClient(
-            line[0], username=SVN_USERNAME, password=SVN_PASSWORD
+            line[0], username=svn_username, password=svn_password
         )
         try:
             svn_info = r.info()
-            print(f'Last commit: {svn_info["commit_revision"]}')
+            latest_commit = svn_info["commit_revision"]
+            print(f'Last commit: {latest_commit}')
+            if ignore_history:
+                svn_revisions = str(int(latest_commit) - 1) + ":" + str(int(latest_commit))
         except svn.remote.SvnException as e:
-            print(e)
-            continue
+            # print(e)
+            raise e
         reponame = line[1]
         repodir = os.path.join(os.path.curdir, "git_repos/", reponame)
 
@@ -121,9 +134,9 @@ if __name__ == "__main__":
             "git",
             "svn",
             "clone",
-            f"--username={SVN_USERNAME}",
-            "--stdlayout",
-            f"--revision={args.svn_revisions}",
+            f"--username={svn_username}",
+            "--stdlayout" if not no_stdlayout else "",
+            f"--revision={svn_revisions}",
             f"--authors-file={args.svn_authors_file}",
             line[0],
             repodir,
@@ -166,10 +179,10 @@ if __name__ == "__main__":
 
         if not "origin" in repo.remotes:
             print(f"Creating remote url")
-            repo.create_remote("origin", REMOTE_URL_BASE + reponame + ".git")
-        elif not REMOTE_URL_BASE in repo.remotes.origin.url:
+            repo.create_remote("origin", remote_url_base + reponame + ".git")
+        elif not remote_url_base in repo.remotes.origin.url:
             print(f"Updating remote url")
-            repo.remotes.origin.set_url(REMOTE_URL_BASE + reponame + ".git")
+            repo.remotes.origin.set_url(remote_url_base + reponame + ".git")
 
         rc, output = execute(["git", "-C", repodir, "push", "origin", "--all"])
         if rc != 0:
