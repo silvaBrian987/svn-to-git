@@ -89,6 +89,7 @@ if __name__ == "__main__":
     parser.add_argument("--git-base-url", default="https://github.com/username/")
     parser.add_argument("--ignore-history", action="store_true")
     parser.add_argument("--no-stdlayout", action="store_true")
+    parser.add_argument("--migrate-from-copy", action="store_true")
 
     args = parser.parse_args()
 
@@ -98,6 +99,7 @@ if __name__ == "__main__":
     svn_revisions = args.svn_revisions
     no_stdlayout = args.no_stdlayout
     ignore_history = args.ignore_history
+    migrate_from_copy = args.migrate_from_copy
 
     lines = []
     with open(args.svn_repos_file, "r") as f:
@@ -117,15 +119,15 @@ if __name__ == "__main__":
         r = svn.remote.RemoteClient(
             line[0], username=svn_username, password=svn_password
         )
-        try:
-            svn_info = r.info()
-            latest_commit = svn_info["commit_revision"]
-            print(f'Last commit: {latest_commit}')
-            if ignore_history:
-                svn_revisions = str(int(latest_commit) - 1) + ":" + str(int(latest_commit))
-        except svn.remote.SvnException as e:
-            # print(e)
-            raise e
+        
+        svn_info = r.info()
+        latest_commit = svn_info["commit_revision"]
+        print(f'Last commit: {latest_commit}')
+        if migrate_from_copy:
+            log = list(r.log_default(stop_on_copy=True))[-1]
+            svn_revisions = f"{log.revision}:{latest_commit}"
+        if ignore_history:
+            svn_revisions = str(int(latest_commit) - 1) + ":" + str(int(latest_commit))
         reponame = line[1]
         repodir = os.path.join(os.path.curdir, "git_repos/", reponame)
 
@@ -136,7 +138,7 @@ if __name__ == "__main__":
             "clone",
             f"--username={svn_username}",
             "--stdlayout" if not no_stdlayout else "",
-            f"--revision={svn_revisions}",
+            f"--revision={svn_revisions}" if svn_revisions else "",
             f"--authors-file={args.svn_authors_file}",
             line[0],
             repodir,
