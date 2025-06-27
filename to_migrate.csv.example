@@ -1,3 +1,4 @@
+svn_url,git_path,svn_revisions
 svn://localhost/example1,example1
-svn://localhost/example2,example2
-#svn://localhost/example3,example3
+svn://localhost/example2,group/example2
+#svn://localhost/example3,example3,1640193:1725461
