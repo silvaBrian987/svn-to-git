@@ -9,6 +9,7 @@ import git
 from git import Repo, RemoteReference
 import argparse
 from csv import DictReader
+import traceback
 
 if platform.system() == "Windows":
     AUTHORS_DEFAULT_FILEPATH = "authors.txt"
@@ -118,6 +119,7 @@ def migrateRepo(repoToMigrate: RepoToMigrate, git_base_url, svn_username, svn_pa
 
     if not skip_svn_clone:
         # shutil.rmtree(repodir, onerror = handler)
+        execute(["svn", "checkout", "--username", svn_username, "--password", svn_password, "--depth", "empty", svn_url, repodir])
         keep_goin = True
         while keep_goin:
             cmd = [
@@ -246,4 +248,5 @@ if __name__ == "__main__":
                 print(f"Migration of {repoToMigrate.svn_url} completed.")
             except Exception as e:
                 print(f"Error on migration of {repoToMigrate.svn_url}: {e}")
+                traceback.print_exc()
                 continue
