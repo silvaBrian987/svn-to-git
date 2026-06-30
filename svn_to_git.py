@@ -1,11 +1,12 @@
 from os import mkdir, rmdir
 import os
+import re
+import shutil
 import subprocess
 import svn.remote
 import platform
 import sys
 import psutil
-import git
 from git import Repo, RemoteReference
 import argparse
 from csv import DictReader
@@ -17,7 +18,6 @@ else:
     AUTHORS_DEFAULT_FILEPATH = "./authors.txt"
 
 USER_HOME = os.path.expanduser("~")
-
 
 class RepoToMigrate:
     def __init__(self, svn_url, git_path, svn_revisions=None):
@@ -76,6 +76,34 @@ def execute(cmd):
         return process.returncode, "\n".join(output)
 
 
+COMMITTER_EMAIL_BLOCKED_RE = re.compile(
+    r"You cannot push commits for '([^']+)'"
+)
+
+
+def rewrite_committer_identity(repodir, replacement_name, replacement_email):
+    """Rewrite author and committer name+email on all commits using git filter-branch."""
+    print(
+        f"Rewriting all commits identity to "
+        f"'{replacement_name} <{replacement_email}>' in {repodir}"
+    )
+    env_filter = (
+        f"GIT_AUTHOR_NAME='{replacement_name}'\n"
+        f"GIT_AUTHOR_EMAIL='{replacement_email}'\n"
+        f"GIT_COMMITTER_NAME='{replacement_name}'\n"
+        f"GIT_COMMITTER_EMAIL='{replacement_email}'\n"
+    )
+    rc, output = execute([
+        "git", "-C", repodir,
+        "filter-branch", "-f",
+        "--env-filter", env_filter,
+        "--tag-name-filter", "cat",
+        "--", "--branches",
+    ])
+    if rc != 0:
+        raise Exception(f"git filter-branch failed:\n{output}")
+
+
 # exception handler
 def handler(func, path, exc_info):
     import stat
@@ -88,7 +116,33 @@ def handler(func, path, exc_info):
         raise
 
 
-def migrateRepo(repoToMigrate: RepoToMigrate, git_base_url, svn_username, svn_password, svn_authors_file, migrate_from_copy=False, ignore_history=False, no_stdlayout=False, skip_svn_clone=False):
+def push_branch_with_identity_rewrite(repodir, branch_name, replacement_name, replacement_email):
+    """Push branch; if GitLab rejects due to committer identity policy,
+    rewrite all commits with the provided name+email and retry once."""
+    rc, output = execute(["git", "-C", repodir, "push", "origin", branch_name])
+    if rc == 0:
+        return rc, output
+    if COMMITTER_EMAIL_BLOCKED_RE.search(output) and replacement_email:
+        blocked_email = COMMITTER_EMAIL_BLOCKED_RE.search(output).group(1)
+        print(
+            f"Push rejected for committer '{blocked_email}'. "
+            "Rewriting identity and retrying..."
+        )
+        rewrite_committer_identity(repodir, replacement_name, replacement_email)
+        # After rewriting, re-merge remote commits that Backstage may have
+        # added when creating the repo (unrelated histories).
+        execute(["git", "-C", repodir, "fetch", "origin", "--tags"])
+        rc_pull, out_pull = execute([
+            "git", "-C", repodir, "pull", "origin", branch_name,
+            "--allow-unrelated-histories", "--no-rebase",
+        ])
+        if rc_pull != 0:
+            print(f"WARN: pull after rewrite failed (will attempt push anyway):\n{out_pull}")
+        rc, output = execute(["git", "-C", repodir, "push", "origin", branch_name])
+    return rc, output
+
+
+def migrateRepo(repoToMigrate: RepoToMigrate, git_base_url, svn_username, svn_password, svn_authors_file, migrate_from_copy=False, ignore_history=False, no_stdlayout=False, skip_svn_clone=False, git_committer_name=None, git_committer_email=None):
     svn_url = repoToMigrate.svn_url
     svn_repo = svn.remote.RemoteClient(
         svn_url, username=svn_username, password=svn_password
@@ -108,12 +162,23 @@ def migrateRepo(repoToMigrate: RepoToMigrate, git_base_url, svn_username, svn_pa
             latest_commit = svn_info["commit_revision"]
             print(f'Last commit: {latest_commit}')
             svn_revisions = f"BASE:{latest_commit}"
-            if migrate_from_copy:
-                log = list(svn_repo.log_default(stop_on_copy=True))[-1]
-                svn_revisions = f"{log.revision}:{latest_commit}"
+
+            # Ignore-history has precedence over migrate-from-copy because it
+            # explicitly requests only the latest commit.
             if ignore_history:
                 svn_revisions = str(int(latest_commit) - 1) + \
                     ":" + str(int(latest_commit))
+            elif migrate_from_copy:
+                try:
+                    log = list(svn_repo.log_default(stop_on_copy=True))[-1]
+                    svn_revisions = f"{log.revision}:{latest_commit}"
+                except Exception as ex:
+                    # Python 3.12 breaks some versions of python-svn
+                    # (Element.getchildren removed). Fall back to full history.
+                    print(
+                        "WARN: Could not compute copy revision with python-svn "
+                        f"({ex}). Falling back to BASE:{latest_commit}."
+                    )
     reponame = repoToMigrate.git_path
     repodir = os.path.join(os.path.curdir, "git_repos/", reponame)
 
@@ -173,6 +238,9 @@ def migrateRepo(repoToMigrate: RepoToMigrate, git_base_url, svn_username, svn_pa
                 print(
                     f"WARN: Ignoring branch {branch_name} because already exists")
                 continue
+            if branch_name == "HEAD":
+                print("WARN: Ignoring HEAD symbolic ref")
+                continue
             if branch_name == "trunk":
                 print(f"WARN: Ignoring trunk because is already the branch master")
                 continue
@@ -184,6 +252,10 @@ def migrateRepo(repoToMigrate: RepoToMigrate, git_base_url, svn_username, svn_pa
         print(f"Creating branch main")
         repo.branches.master.rename("main")
 
+    if "HEAD" in repo.branches:
+        print("Removing invalid local branch HEAD")
+        repo.delete_head("HEAD", force=True)
+
     remote_url = git_base_url + reponame + ".git"
     if not "origin" in repo.remotes:
         print(f"Creating remote url {remote_url}")
@@ -192,9 +264,43 @@ def migrateRepo(repoToMigrate: RepoToMigrate, git_base_url, svn_username, svn_pa
         print(f"Updating remote url {remote_url}")
         repo.remotes.origin.set_url(remote_url)
 
-    rc, output = execute(["git", "-C", repodir, "push", "origin", "--all"])
+    rc, output = execute(["git", "-C", repodir, "fetch", "origin", "--tags"])
     if rc != 0:
         raise Exception(f"Error: {rc}\n{output}")
+
+    local_branch = "main" if "main" in repo.branches else "master"
+    rc, output = execute(["git", "-C", repodir, "checkout", local_branch])
+    if rc != 0:
+        raise Exception(f"Error: {rc}\n{output}")
+
+    rc, output = execute(["git", "-C", repodir, "ls-remote", "--heads", "origin", "main"])
+    if rc != 0:
+        raise Exception(f"Error: {rc}\n{output}")
+
+    if output.strip():
+        print("Remote branch main exists. Merging unrelated histories before push.")
+        rc, output = execute([
+            "git",
+            "-C",
+            repodir,
+            "pull",
+            "origin",
+            "main",
+            "--allow-unrelated-histories",
+            "--no-rebase",
+        ])
+        if rc != 0:
+            raise Exception(f"Error: {rc}\n{output}")
+
+    for branch in repo.branches:
+        if branch.name == "HEAD":
+            continue
+        rc, output = push_branch_with_identity_rewrite(
+            repodir, branch.name, git_committer_name, git_committer_email
+        )
+        if rc != 0:
+            raise Exception(f"Error: {rc}\n{output}")
+
     rc, output = execute(["git", "-C", repodir, "push", "origin", "--tags"])
     if rc != 0:
         raise Exception(f"Error: {rc}\n{output}")
@@ -214,6 +320,16 @@ if __name__ == "__main__":
     parser.add_argument("--no-stdlayout", action="store_true")
     parser.add_argument("--migrate-from-copy", action="store_true")
     parser.add_argument("--skip-svn-clone", action="store_true")
+    parser.add_argument(
+        "--git-committer-name",
+        default=None,
+        help="Full name to use when rewriting committer identity (e.g. 'Brian Silva').",
+    )
+    parser.add_argument(
+        "--git-committer-email",
+        default=None,
+        help="Verified GitLab email to use when a push is rejected due to committer identity policy.",
+    )
 
     args = parser.parse_args()
 
@@ -226,9 +342,19 @@ if __name__ == "__main__":
     migrate_from_copy = args.migrate_from_copy
     svn_authors_file = args.svn_authors_file
     skip_svn_clone = args.skip_svn_clone
+    git_committer_name = args.git_committer_name
+    git_committer_email = args.git_committer_email
 
-    if not os.path.exists(args.git_repos_path):
-        mkdir(args.git_repos_path)
+    if ignore_history and migrate_from_copy:
+        print(
+            "WARN: --ignore-history and --migrate-from-copy were both set. "
+            "Using --ignore-history (last revision only)."
+        )
+
+    if os.path.exists(args.git_repos_path):
+        print(f"Removing existing {args.git_repos_path}...")
+        shutil.rmtree(args.git_repos_path)
+    mkdir(args.git_repos_path)
 
     with open(args.svn_repos_file, "r") as f:
         reader = DictReader(f)
@@ -244,7 +370,7 @@ if __name__ == "__main__":
                 print(
                     f"Migrating {repoToMigrate.svn_url} to {repoToMigrate.git_path}")
                 migrateRepo(repoToMigrate, git_base_url=remote_url_base, svn_username=svn_username, svn_password=svn_password,
-                            svn_authors_file=svn_authors_file, migrate_from_copy=migrate_from_copy, ignore_history=ignore_history, no_stdlayout=no_stdlayout, skip_svn_clone=skip_svn_clone)
+                            svn_authors_file=svn_authors_file, migrate_from_copy=migrate_from_copy, ignore_history=ignore_history, no_stdlayout=no_stdlayout, skip_svn_clone=skip_svn_clone, git_committer_name=git_committer_name, git_committer_email=git_committer_email)
                 print(f"Migration of {repoToMigrate.svn_url} completed.")
             except Exception as e:
                 print(f"Error on migration of {repoToMigrate.svn_url}: {e}")
